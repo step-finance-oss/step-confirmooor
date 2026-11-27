@@ -11,7 +11,7 @@ pub(super) struct Bucket {
     pub blockhash: Option<String>,
     pub block_time: Option<i64>,
     pub parent_slot: Option<u64>,
-    pub slots_in_same_second: u8,
+    pub slots_in_same_second: Option<u8>,
     ack_metadata: Option<oneshot::Sender<()>>,
     ack_processed: Option<oneshot::Sender<()>>,
     ack_confirmed: Option<oneshot::Sender<()>>,
@@ -27,7 +27,7 @@ impl Bucket {
             blockhash: None,
             block_time: None,
             parent_slot: None,
-            slots_in_same_second: 0,
+            slots_in_same_second: None,
             ack_metadata: None,
             ack_processed: None,
             ack_confirmed: None,
@@ -43,9 +43,9 @@ impl Bucket {
             return None;
         }
 
-        if matches!(self.status, SlotStatus::Confirmed) && self.blockhash.is_some() {
+        if let Some(index) = self.confirmed_index() {
             msg.set_blocktime(self.block_time);
-            msg.set_slot_in_seconds(self.slots_in_same_second);
+            msg.set_slot_in_seconds(index);
             return Some(msg);
         }
 
@@ -76,7 +76,7 @@ impl Bucket {
         }
 
         self.slot = 0;
-        self.slots_in_same_second = 0;
+        self.slots_in_same_second = None;
         self.status = SlotStatus::Processed;
         self.block_time = None;
         self.blockhash = None;
@@ -88,7 +88,6 @@ impl Bucket {
         &mut self,
         blockhash: String,
         block_time: i64,
-        slots_in_same_second: u8,
         ack: oneshot::Sender<()>,
     ) -> Vec<MessageWithMeta> {
         if self.blockhash.is_some() {
@@ -97,7 +96,6 @@ impl Bucket {
         }
         self.blockhash = Some(blockhash);
         self.block_time = Some(block_time);
-        self.slots_in_same_second = slots_in_same_second;
         self.ack_metadata = Some(ack);
         if !matches!(self.status, SlotStatus::Confirmed) && !self.msgs.is_empty() {
             metrics::counter!("meta_before_status").increment(1);
@@ -134,11 +132,19 @@ impl Bucket {
         self.flush_ready("status")
     }
 
-    fn flush_ready(&mut self, trigger: &'static str) -> Vec<MessageWithMeta> {
-        if !matches!(self.status, SlotStatus::Confirmed)
-            || self.blockhash.is_none()
-            || self.msgs.is_empty()
-        {
+    fn confirmed_index(&self) -> Option<u8> {
+        if matches!(self.status, SlotStatus::Confirmed) {
+            self.slots_in_same_second
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn flush_ready(&mut self, trigger: &'static str) -> Vec<MessageWithMeta> {
+        let Some(index) = self.confirmed_index() else {
+            return Vec::new();
+        };
+        if self.msgs.is_empty() {
             return Vec::new();
         }
         metrics::histogram!("messages_flushed", "chain_type" => trigger)
@@ -147,7 +153,7 @@ impl Bucket {
             .drain(..)
             .map(|mut msg| {
                 msg.set_blocktime(self.block_time);
-                msg.set_slot_in_seconds(self.slots_in_same_second);
+                msg.set_slot_in_seconds(index);
                 msg
             })
             .collect()

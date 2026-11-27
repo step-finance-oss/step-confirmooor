@@ -17,6 +17,10 @@ const RING_SIZE_USIZE: usize = 100;
 pub const RING_SIZE: u64 = RING_SIZE_USIZE as u64;
 const RETAINED_SLOTS: u64 = RING_SIZE * 3 / 4;
 
+// Per retained slot: one processed status, confirmation, metadata, and statistics
+// delivery can hold broker credit. One more credit lets the next slot expire them.
+pub(crate) const MIN_CHAIN_PREFETCH: u16 = (4 * RETAINED_SLOTS + 1) as u16;
+
 /// Events wait for both confirmation and block metadata in the bucket for their slot.
 pub struct TransactionRingBuffer {
     tip: RwLock<u64>,
@@ -32,7 +36,7 @@ pub struct BucketSummary {
     pub block_time: Option<i64>,
     pub has_blockhash: bool,
     pub parent_slot: Option<u64>,
-    pub slots_in_same_second: u8,
+    pub slots_in_same_second: Option<u8>,
     pub dedup_set_len: usize,
 }
 
@@ -119,25 +123,55 @@ impl TransactionRingBuffer {
     ) -> Result<()> {
         let slot = meta.slot;
         let pending = {
-            let Some(_tip) = self.live_window(slot) else {
+            let Some(tip) = self.live_window(slot) else {
                 let _ = ack.send(());
                 bail!("expired block metadata for slot {slot}");
             };
-            let mut same_second = 0;
-            for prior in (slot.saturating_sub(5)..slot).rev() {
-                let bucket = self.ring[get_slot_index(prior)].read();
-                if bucket.slot != prior || bucket.block_time.is_none() {
-                    continue;
-                }
-                if bucket.block_time == Some(meta.block_time) {
-                    same_second = bucket.slots_in_same_second.saturating_add(1);
-                }
-                break;
-            }
-            self.bucket_for(slot)
-                .update_meta(meta.blockhash, meta.block_time, same_second, ack)
+            let mut pending =
+                self.bucket_for(slot)
+                    .update_meta(meta.blockhash, meta.block_time, ack);
+            self.resolve_indices(slot, *tip, &mut pending);
+            pending
         };
         self.send_confirmed(pending).await
+    }
+
+    // A parent's time establishes a second boundary. Within that second, its
+    // resolved index establishes the child's. Visit descendants in slot order
+    // so late metadata or a late parent link can release already-confirmed data.
+    fn resolve_indices(&self, first: u64, tip: u64, pending: &mut Vec<MessageWithMeta>) {
+        for slot in first..=tip {
+            let bucket = self.ring[get_slot_index(slot)].read();
+            if bucket.slot != slot || bucket.slots_in_same_second.is_some() {
+                continue;
+            }
+            let Some(time) = bucket.block_time else {
+                continue;
+            };
+            let parent_slot = bucket.parent_slot;
+            drop(bucket);
+            let index = if slot == 0 {
+                Some(0)
+            } else if let Some(parent_slot) = parent_slot {
+                let parent = self.ring[get_slot_index(parent_slot)].read();
+                if parent.slot != parent_slot || parent.block_time.is_none() {
+                    None
+                } else if parent.block_time == Some(time) {
+                    parent
+                        .slots_in_same_second
+                        .and_then(|idx| idx.checked_add(1))
+                } else {
+                    Some(0)
+                }
+            } else {
+                None
+            };
+            if let Some(index) = index {
+                let mut bucket = self.bucket_for(slot);
+                bucket.slots_in_same_second = Some(index);
+                pending.extend(bucket.flush_ready("index"));
+            }
+        }
     }
 
     pub async fn process_status(
@@ -185,6 +219,7 @@ impl TransactionRingBuffer {
                 parent = bucket.parent_slot;
             }
             pending.extend(child_pending);
+            self.resolve_indices(slot, *tip, &mut pending);
             pending
         };
         self.send_confirmed(pending).await
@@ -346,6 +381,8 @@ mod tests {
         let slot = 1_000;
         let time = 1_700_000_000;
 
+        let _boundary = meta(&ring, slot - 1, time - 1).await?;
+        let _parent_link = status(&ring, slot, Some(slot - 1), SlotStatus::Processed).await?;
         let mut first = submit(&ring, transaction(slot, SIGNATURE_A), "parent.transaction").await?;
         let mut duplicate = submit(&ring, transaction(slot, SIGNATURE_A), "duplicate").await?;
         assert_eq!(duplicate.try_recv(), Ok(()));
@@ -496,8 +533,83 @@ mod tests {
         let _confirmed = status(&ring, new, Some(old), SlotStatus::Confirmed).await?;
         assert_idle(&mut output);
         let _meta = meta(&ring, new, 456).await?;
-        assert_transaction(&mut output, "reused", new, 456, 0, SIGNATURE_A);
+        // The missing parent time cannot establish an ordinal. A known second
+        // boundary on the child resumes output without using the aliased bucket.
         assert_idle(&mut output);
+        let _child_meta = meta(&ring, new + 1, 457).await?;
+        let _child_status = status(&ring, new + 1, Some(new), SlotStatus::Confirmed).await?;
+        let _child_tx = submit(&ring, transaction(new + 1, SIGNATURE_A), "child").await?;
+        assert_transaction(&mut output, "child", new + 1, 457, 0, SIGNATURE_A);
+        assert_idle(&mut output);
+        Ok(())
+    }
+
+    #[test]
+    fn workers_partition_transactions_and_stats_and_share_status() {
+        use crate::rabbit::WorkerPartition;
+        let slot = 101;
+        let owners = |data, route: &str| {
+            let msg = MessageWithMeta {
+                data,
+                routing_key: route.into(),
+                acker: oneshot::channel().0,
+            };
+            (0..3)
+                .filter(|&index| WorkerPartition { count: 3, index }.owns(&msg))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            owners(transaction(slot, SIGNATURE_A), "dex.transaction"),
+            [2]
+        );
+        assert_eq!(
+            owners(transaction(slot, SIGNATURE_A), "dex.transaction.3"),
+            [0]
+        );
+        assert_eq!(
+            owners(
+                Message::SlotStatisticsNotify(SlotStatistics {
+                    slot,
+                    ..Default::default()
+                }),
+                "multi.chain.slot_statistics.5"
+            ),
+            [2]
+        );
+        assert_eq!(
+            owners(
+                Message::SlotStatusNotify(SlotStatusNotify {
+                    slot,
+                    parent: Some(100),
+                    status: SlotStatus::Confirmed,
+                }),
+                "multi.chain.slot_status.5"
+            ),
+            [0, 1, 2]
+        );
+    }
+
+    #[tokio::test]
+    async fn same_second_indices_follow_parents_in_both_delivery_orders() -> Result<()> {
+        for order in [[100, 102], [102, 100]] {
+            let (sender, mut out) = mpsc::channel(4);
+            let ring = TransactionRingBuffer::new(1, sender);
+            let _boundary = meta(&ring, 99, 9).await?;
+            let _link = status(&ring, 100, Some(99), SlotStatus::Processed).await?;
+            let _confirm = status(&ring, 102, Some(100), SlotStatus::Confirmed).await?;
+            // Slot 101 belongs to another fork and must not affect slot 102.
+            let _fork = meta(&ring, 101, 10).await?;
+            let _tx1 = submit(&ring, transaction(100, SIGNATURE_A), "first").await?;
+            let _tx2 = submit(&ring, transaction(102, SIGNATURE_B), "second").await?;
+            for slot in order {
+                let _metadata = meta(&ring, slot, 10).await?;
+                if slot == 102 && order[0] == 102 {
+                    assert_idle(&mut out);
+                }
+            }
+            assert_transaction(&mut out, "first", 100, 10, 0, SIGNATURE_A);
+            assert_transaction(&mut out, "second", 102, 10, 1, SIGNATURE_B);
+        }
         Ok(())
     }
 
@@ -507,7 +619,8 @@ mod tests {
         let ring = TransactionRingBuffer::new(1, sender);
         let slot = 20;
         let mut receipt = submit(&ring, transaction(slot, SIGNATURE_A), "transaction").await?;
-        let _confirmed = status(&ring, slot, None, SlotStatus::Confirmed).await?;
+        let _boundary = meta(&ring, slot - 1, 122).await?;
+        let _confirmed = status(&ring, slot, Some(slot - 1), SlotStatus::Confirmed).await?;
         drop(output);
         assert!(meta(&ring, slot, 123).await.is_err());
         assert_eq!(

@@ -197,6 +197,30 @@ pub enum ThreadType {
     Chain,
 }
 
+#[derive(Clone, Copy)]
+pub struct WorkerPartition {
+    pub count: usize,
+    pub index: usize,
+}
+
+impl WorkerPartition {
+    pub(crate) fn owns(&self, msg: &MessageWithMeta) -> bool {
+        if self.count == 1 {
+            return true;
+        }
+        let shard = match &msg.data {
+            Message::TransactionNotify(_) => msg
+                .routing_key
+                .rsplit_once('.')
+                .and_then(|(_, suffix)| suffix.parse::<u64>().ok())
+                .unwrap_or_else(|| msg.get_slot()),
+            Message::SlotStatisticsNotify(stats) => stats.slot,
+            _ => return true,
+        };
+        shard % self.count as u64 == self.index as u64
+    }
+}
+
 pub struct Receiver {
     consumer: Consumer,
 }
@@ -246,6 +270,7 @@ impl Receiver {
         my_slot_counter: Arc<AtomicU64>,
         other_slot_counter: Arc<AtomicU64>,
         thread_type: ThreadType,
+        workers: WorkerPartition,
         tasks: &mut JoinSet<Result<()>>,
         settlement_failure: mpsc::Sender<anyhow::Error>,
         work_queue: Arc<TaskQueue>,
@@ -280,6 +305,10 @@ impl Receiver {
                 // Update the slot counter if this slot is greater
                 my_slot_counter.fetch_max(msg_slot, Ordering::Relaxed);
 
+                if !workers.owns(&msg) {
+                    let _ = msg.acker.send(());
+                    continue;
+                }
                 let start_time = Instant::now();
                 let mut had_to_sleep = false;
                 while (other_slot_counter.load(Ordering::Relaxed) as i128)

@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
 use crate::rabbit::*;
-use crate::tx_ring_buffer::TransactionRingBuffer;
+use crate::tx_ring_buffer::{TransactionRingBuffer, MIN_CHAIN_PREFETCH};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use indexer_rabbitmq::geyser::QueueKind;
 use indexer_rabbitmq::{
@@ -129,6 +129,10 @@ impl ProcessArgs {
             "queue prefetch and send buffer sizes must be positive"
         );
         ensure!(
+            self.chain_queue_prefetch >= MIN_CHAIN_PREFETCH,
+            "CHAIN_QUEUE_PREFETCH must be at least {MIN_CHAIN_PREFETCH} to advance the retained slot window"
+        );
+        ensure!(
             self.allow_chain_x_ahead >= 0 && self.allow_tx_x_ahead >= 0,
             "slot lead allowances must be nonnegative"
         );
@@ -189,15 +193,13 @@ pub(crate) async fn process(args: ProcessArgs) -> Result<()> {
     let mut tasks = JoinSet::new();
     let (settlement_failure, mut settlement_failures) = mpsc::channel(1);
 
-    //figure out the shard numbers we need to listen to
-    let shard_numbers = (0..args.shard_total)
-        .filter(|i| i % args.conf_shards == args.my_shard)
-        .collect::<Vec<_>>();
-
-    debug!("shard_total: {}", args.shard_total);
-    debug!("conf_shards: {}", args.conf_shards);
-    debug!("my_shard: {}", args.my_shard);
-    debug!("therefore... listening to shards: {:?}", shard_numbers);
+    // Every worker sees the legacy unsuffixed route and advances its stream watermark.
+    // Select one owner per transaction after delivery.
+    let shard_numbers = (0..args.shard_total).collect();
+    let workers = WorkerPartition {
+        count: args.conf_shards,
+        index: args.my_shard,
+    };
 
     let tx_work_queue = Arc::new(TaskQueue::new(args.tx_queue_prefetch.into()));
 
@@ -265,6 +267,7 @@ pub(crate) async fn process(args: ProcessArgs) -> Result<()> {
         tx_slot_counting_u64.clone(),
         chain_slot_counting_u64.clone(),
         ThreadType::Transactions,
+        workers,
         &mut tasks,
         settlement_failure.clone(),
         tx_work_queue,
@@ -277,6 +280,7 @@ pub(crate) async fn process(args: ProcessArgs) -> Result<()> {
         chain_slot_counting_u64,
         tx_slot_counting_u64,
         ThreadType::Chain,
+        workers,
         &mut tasks,
         settlement_failure,
         chain_work_queue,
@@ -369,6 +373,12 @@ mod tests {
         args.conf_shards = 0;
         assert!(args.validate().is_err());
         args.conf_shards = 1;
+        args.chain_queue_prefetch = MIN_CHAIN_PREFETCH - 1;
+        assert!(args.validate().is_err());
+        args.chain_queue_prefetch = 1;
+        assert!(args.validate().is_err());
+        args.chain_queue_prefetch = MIN_CHAIN_PREFETCH;
+        assert!(args.validate().is_ok());
         args.tx_queue_prefetch = 0;
         assert!(args.validate().is_err());
     }
