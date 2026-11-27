@@ -1,0 +1,38 @@
+[package]
+name = "indexer-confirmation-mgmt"
+version = "0.3.1"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+clap = { version = "3.0.7", features = ["derive", "env"] }
+axum = "0.6"
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.17", default-features = false }
+dotenv = { package = "dotenvy", version = "0.15" }
+lapin = { version = "2.0.3", features = ["rustls"] }
+log = "0.4.14"
+tokio = { version = "1.45", features = ["full"] }
+tokio-executor-trait = "2.1"
+tokio-reactor-trait = "1.1"
+serde = { version = "1.0.133", features = ["derive"] }
+serde_json = "1"
+anyhow = "1.0.45"
+env_logger = "0.11"
+arrayvec = "0.7.2"
+parking_lot = "0.12.1"
+hostname = "0.4"
+deadqueue = "0.2.4"
+
+solana-transaction-status = "=2.2.15"
+
+[dependencies.indexer-rabbitmq]
+package = "holaplex-indexer-rabbitmq"
+git = "https://github.com/step-finance/indexer-geyser-plugin"
+rev = "bdd538e0d82ee1941281cbdcffa6ee4d7d529ac2"
+features = ["consumer", "consume-json", "geyser"]
+
+# The plugin uses Step’s transaction metadata, including slotSecondIdx.
+[patch.crates-io]
+solana-transaction-status = { git = 'https://github.com/step-finance/agave', rev = "93b47506cae28ca8a3361ae71da0e24c15c803e7" }
+agave-geyser-plugin-interface = { git = "https://github.com/step-finance/agave", rev = "93b47506cae28ca8a3361ae71da0e24c15c803e7" }
